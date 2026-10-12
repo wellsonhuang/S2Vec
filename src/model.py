@@ -1,265 +1,431 @@
+"""
+H3-S2Vec: S2Vec-style hierarchical masked autoencoder on the H3 grid.
+
+Each resolution-6 parent cell is expanded into all of its resolution-8 children (49 cells),
+which form one fixed-length token sequence.
+
+  - Children without data are represented by a learnable missing token.
+  - Masking and reconstruction are restricted to observed children; masked children are
+    removed from attention with a key mask.
+  - A macro token (mean of the visible children) is prepended as a parent-level summary.
+  - Positions are encoded from each child's offset (km) to the parent center with Fourier
+    features ("fourier"), learned H3 slot embeddings ("slot"), or both.
+  - The validation set is split by parent; the checkpoint with the lowest validation loss is kept.
+  - Embeddings are the final encoder outputs of each child, computed without masking.
+"""
 import os
-import polars as pl
+import math
+import json
+import warnings
+import logging
+
 import numpy as np
+import polars as pl
+import h3
 import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 import pytorch_lightning as pl_lightning
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
-import h3
-from scipy.spatial import cKDTree
-from timm.models.vision_transformer import Block
 from tqdm import tqdm
-import warnings
 
 warnings.filterwarnings("ignore")
-import logging
 logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
+torch.set_float32_matmul_precision("medium")
 
-# ==========================================
-# 1. Core MAE Architecture (Encoder & Decoder)
-# ==========================================
-class MAEEncoder(nn.Module):
-    def __init__(self, embed_dim: int, depth: int, num_heads: int, dropout_prob: float):
-        super().__init__()
-        self.norm = nn.LayerNorm(embed_dim)
-        self.blocks = nn.ModuleList([
-            Block(embed_dim, num_heads=num_heads, qkv_bias=True, proj_drop=dropout_prob, attn_drop=dropout_prob)
-            for _ in range(depth)
-        ])
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        for block in self.blocks: 
-            x = block(x)
-        return self.norm(x)
+# ==========================================================
+# Configuration
+# ==========================================================
+DATA_PATH   = "./data/texas_pre.parquet"
+OUTPUT_PATH = "./embedding/texas_final.parquet"
+CKPT_DIR    = "./checkpoints/texas_final"
+HEX_COL     = "hex_id"
+LABEL_KEYWORDS = ["sovi", "nri"]     # columns containing these keywords are never used as features
 
-class MAEDecoder(nn.Module):
-    def __init__(self, decoder_dim: int, patch_dim: int, depth: int, num_heads: int, dropout_prob: float):
-        super().__init__()
-        self.norm = nn.LayerNorm(decoder_dim)
-        self.blocks = nn.ModuleList([
-            Block(decoder_dim, num_heads=num_heads, qkv_bias=True, proj_drop=dropout_prob, attn_drop=dropout_prob)
-            for _ in range(depth)
-        ])
-        self.output = nn.Linear(decoder_dim, patch_dim)
-        nn.init.xavier_uniform_(self.output.weight)
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        for block in self.blocks: 
-            x = block(x)
-        return self.output(self.norm(x))
+PARENT_RES  = 6
+CHILD_RES   = None                   # None = inferred from the data (e.g., 8)
 
-# ==========================================
-# 2. Real-world Spatial Dataset (Dynamic Relative Coordinates)
-# ==========================================
-class H3SpatialDataset(Dataset):
-    def __init__(self, parquet_path, seq_len=64):
-        self.seq_len = seq_len
-        print("Loading Parquet data and building spatial KD-Tree...")
-        
+# Positional encoding
+POS_MODE    = "fourier"              # "fourier" | "slot" | "both"
+NUM_FREQ    = 8
+FREQ_MIN    = 1 / 16.0               # cycles per km (wavelength 16 km)
+FREQ_MAX    = 2.0                    # cycles per km (wavelength 0.5 km)
+
+# Masking
+MASKING        = "random"            # "random" | "block"
+MASK_RATIO     = 0.5
+BLOCK_NOISE_KM = 1.0
+
+# Model (Table 1)
+EMBED_DIM      = 128
+DECODER_DIM    = 256
+ENCODER_LAYERS = 2
+DECODER_LAYERS = 3
+NUM_HEADS      = 8
+DROPOUT        = 0.3
+
+# Training (Table 1)
+BATCH_SIZE   = 64
+MAX_EPOCHS   = 100
+LR           = 5e-4
+WEIGHT_DECAY = 0.01
+COSINE_ALPHA = 0.1                   # final learning rate = LR * COSINE_ALPHA
+GRAD_CLIP    = 2.0
+VAL_FRAC     = 0.15                  # fraction of parents held out for validation
+PATIENCE     = 30
+MIN_VALID_TRAIN = 2                  # minimum observed children for a parent to be used
+NUM_WORKERS  = 0
+SEED         = 42
+
+
+# ==========================================================
+# Utilities
+# ==========================================================
+def h3_digits_slot(child: str, parent_res: int, child_res: int) -> int:
+    """Fixed position of a child within its parent, derived from the H3 index digits."""
+    v = h3.str_to_int(child)
+    slot = 0
+    for r in range(parent_res + 1, child_res + 1):
+        d = (v >> ((15 - r) * 3)) & 7
+        slot = slot * 7 + d
+    return slot
+
+
+def latlng_to_km(lat, lng, lat0, lng0):
+    dy = (lat - lat0) * 110.574
+    dx = (lng - lng0) * 111.320 * np.cos(np.radians(lat0))
+    return dx, dy
+
+
+# ==========================================================
+# Dataset: one sample per parent, expanded into all children
+# ==========================================================
+class H3HierarchicalDataset(Dataset):
+    """
+    Each sample is one parent cell.
+    state: 0 = position does not exist (pentagon parent),
+           1 = cell exists but has no data (missing token),
+           2 = cell has data.
+    """
+    def __init__(self, parquet_path, hex_col="hex_id", parent_res=6, child_res=None):
+        print(f"Reading {parquet_path}")
         df = pl.read_parquet(parquet_path)
-        self.hex_ids = df["hex_id"].to_list()
-        
-        # 🚀 變更點：資料在 Preprocessing 已經標準化過了，直接取用即可！
-        self.X_normalized = df.drop("hex_id").cast(pl.Float32).to_numpy()     
-        self.in_ch = self.X_normalized.shape[1]
-        
-        self.coords = np.array([h3.cell_to_latlng(h) for h in self.hex_ids])
-        tree = cKDTree(self.coords)
-        
-        self.window_indices = np.zeros((len(self.hex_ids), self.seq_len), dtype=np.int32)
-        self.relative_coords = np.zeros((len(self.hex_ids), self.seq_len, 2), dtype=np.float32)
-        
-        print("Computing geographic relative coordinates...")
-        _, neighbors_all = tree.query(self.coords, k=self.seq_len)
-        
-        for i in range(len(self.hex_ids)):
-            neighbor_indices = neighbors_all[i]
-            self.window_indices[i] = neighbor_indices
-            
-            center_coord = self.coords[i]
-            neighbor_coords = self.coords[neighbor_indices]
-            
-            self.relative_coords[i] = (neighbor_coords - center_coord) * 100.0 
+        df = df.filter(pl.col(hex_col).is_not_null()).unique(subset=[hex_col], keep="first")
+        df = df.filter(pl.Series([h3.is_valid_cell(h) for h in df[hex_col].to_list()]))
+        self.hex_ids = df[hex_col].to_list()
 
-        print(f"Spatial database constructed. Total grid centers: {len(self.hex_ids)}.")
+        if child_res is None:
+            child_res = h3.get_resolution(self.hex_ids[0])
+        self.parent_res, self.child_res = parent_res, child_res
+        assert child_res > parent_res, "CHILD_RES must be larger than PARENT_RES"
 
-    def __len__(self): 
-        return len(self.hex_ids)
-    
+        # Feature columns (exclude identifiers and labels)
+        self.feature_cols = [
+            c for c, t in df.schema.items()
+            if t.is_numeric() and "hex" not in c.lower()
+            and not any(k in c.lower() for k in LABEL_KEYWORDS)
+        ]
+        dropped = [c for c in df.columns if any(k in c.lower() for k in LABEL_KEYWORDS)]
+        print(f"Features: {len(self.feature_cols)}; excluded label columns: {dropped}")
+
+        X = df.select(self.feature_cols).cast(pl.Float32).to_numpy()
+        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+        mean, std = X.mean(0), X.std(0)
+        std[std < 1e-8] = 1.0
+        self.X = ((X - mean) / std).astype(np.float32)
+        self.in_ch = self.X.shape[1]
+        self.norm_stats = {"mean": mean.tolist(), "std": std.tolist()}
+
+        # Group cells by parent and expand every parent into all children
+        hex_to_row = {h: i for i, h in enumerate(self.hex_ids)}
+        parents = sorted({h3.cell_to_parent(h, parent_res) for h in self.hex_ids})
+        S = 7 ** (child_res - parent_res)
+        P = len(parents)
+        self.num_slots = S
+
+        self.row_idx = np.full((P, S), -1, dtype=np.int64)    # data row of each child (-1 = no data)
+        self.state = np.zeros((P, S), dtype=np.int64)
+        self.coords = np.zeros((P, S, 2), dtype=np.float32)   # km offset from the parent center
+
+        for p_i, p in enumerate(tqdm(parents, desc="Building parent-child index")):
+            lat0, lng0 = h3.cell_to_latlng(p)
+            for c in h3.cell_to_children(p, child_res):
+                s = h3_digits_slot(c, parent_res, child_res)
+                lat, lng = h3.cell_to_latlng(c)
+                self.coords[p_i, s] = latlng_to_km(lat, lng, lat0, lng0)
+                r = hex_to_row.get(c, -1)
+                self.row_idx[p_i, s] = r
+                self.state[p_i, s] = 2 if r >= 0 else 1
+
+        self.parents = parents
+        self.n_valid = (self.state == 2).sum(1)
+        print(f"{len(self.hex_ids)} cells -> {P} parents ({S} positions each, "
+              f"{self.n_valid.mean():.1f} observed on average)")
+
+    def __len__(self):
+        return len(self.parents)
+
     def __getitem__(self, idx):
-        x = torch.tensor(self.X_normalized[self.window_indices[idx]], dtype=torch.float32)
-        rel_coords = torch.tensor(self.relative_coords[idx], dtype=torch.float32)
-        return x, rel_coords
+        return idx
 
-# ==========================================
-# 3. S2Vec Dynamic Coordinate Model (No-CLS Version)
-# ==========================================
+    def collate(self, idxs):
+        idxs = np.asarray(idxs)
+        rows = self.row_idx[idxs]                             # (B, S)
+        x = self.X[np.clip(rows, 0, None)]                    # (B, S, F)
+        x[rows < 0] = 0.0
+        return (
+            torch.from_numpy(x),
+            torch.from_numpy(self.coords[idxs]),
+            torch.from_numpy(self.state[idxs]),
+            torch.from_numpy(rows),
+        )
+
+
+# ==========================================================
+# Model
+# ==========================================================
+class TransformerBlock(nn.Module):
+    """Pre-LN Transformer block with a key mask (tokens with False are never attended to)."""
+    def __init__(self, dim, heads, drop):
+        super().__init__()
+        self.n1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, heads, dropout=drop, batch_first=True)
+        self.drop = nn.Dropout(drop)
+        self.n2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, 4 * dim), nn.GELU(), nn.Dropout(drop),
+            nn.Linear(4 * dim, dim), nn.Dropout(drop),
+        )
+
+    def forward(self, x, key_valid):
+        h = self.n1(x)
+        a, _ = self.attn(h, h, h, key_padding_mask=~key_valid, need_weights=False)
+        x = x + self.drop(a)
+        return x + self.mlp(self.n2(x))
+
+
+class FourierPositionEncoding(nn.Module):
+    """km offsets -> sin/cos(2*pi*f*x) with log-spaced frequencies in [FREQ_MIN, FREQ_MAX]."""
+    def __init__(self, num_freq=8, fmin=1 / 16, fmax=2.0):
+        super().__init__()
+        f = torch.logspace(math.log10(fmin), math.log10(fmax), num_freq)
+        self.register_buffer("freqs", 2 * math.pi * f)
+        self.out_dim = 2 * 2 * num_freq
+
+    def forward(self, coords):                      # (B, S, 2)
+        z = coords.unsqueeze(-1) * self.freqs       # (B, S, 2, F)
+        return torch.cat([torch.sin(z), torch.cos(z)], -1).flatten(-2)
+
+
+class PosEmbed(nn.Module):
+    def __init__(self, dim, num_slots, mode):
+        super().__init__()
+        self.mode = mode
+        if mode in ("fourier", "both"):
+            self.fourier = FourierPositionEncoding(NUM_FREQ, FREQ_MIN, FREQ_MAX)
+            self.mlp = nn.Sequential(nn.Linear(self.fourier.out_dim, dim), nn.GELU(), nn.Linear(dim, dim))
+        if mode in ("slot", "both"):
+            self.slot = nn.Parameter(torch.zeros(1, num_slots, dim))
+            nn.init.normal_(self.slot, std=0.02)
+
+    def forward(self, coords):
+        out = 0
+        if self.mode in ("fourier", "both"):
+            out = out + self.mlp(self.fourier(coords))
+        if self.mode in ("slot", "both"):
+            out = out + self.slot
+        return out
+
+
 class S2VecModelSpatialH3(pl_lightning.LightningModule):
-    def __init__(self, in_ch: int, num_heads=4, encoder_layers=4, decoder_layers=1, 
-                 embed_dim=128, decoder_dim=256, mask_ratio=0.75, lr=0.0005, weight_decay=0.001, dropout_rate=0.1):
+    def __init__(self, in_ch, num_slots, embed_dim=128, decoder_dim=256, encoder_layers=2,
+                 decoder_layers=3, num_heads=8, dropout=0.3, mask_ratio=0.5, masking="random",
+                 pos_mode="fourier", lr=5e-4, weight_decay=0.01, max_epochs=100, cosine_alpha=0.1,
+                 block_noise_km=1.0):
         super().__init__()
         self.save_hyperparameters()
-        self.in_ch = in_ch
-        self.embed_dim = embed_dim
-        self.decoder_dim = decoder_dim
-        self.mask_ratio = mask_ratio
-        self.lr = lr
-        self.weight_decay = weight_decay
 
         self.patch_embed = nn.Linear(in_ch, embed_dim)
-        
-        self.coord_to_pos_embed = nn.Sequential(
-            nn.Linear(2, 64),
-            nn.GELU(),
-            nn.Linear(64, embed_dim)
-        )
-        self.coord_to_dec_pos_embed = nn.Sequential(
-            nn.Linear(2, 64),
-            nn.GELU(),
-            nn.Linear(64, decoder_dim)
-        )
+        self.macro_embed = nn.Linear(in_ch, embed_dim)
+        self.missing_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.macro_pos = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        self.enc_pos = PosEmbed(embed_dim, num_slots, pos_mode)
+        self.encoder = nn.ModuleList([TransformerBlock(embed_dim, num_heads, dropout) for _ in range(encoder_layers)])
+        self.enc_norm = nn.LayerNorm(embed_dim)
 
-        self.encoder = MAEEncoder(embed_dim, encoder_layers, num_heads, dropout_prob=dropout_rate)
         self.decoder_embed = nn.Linear(embed_dim, decoder_dim)
         self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_dim))
-        self.decoder = MAEDecoder(decoder_dim, in_ch, decoder_layers, num_heads, dropout_prob=dropout_rate)
+        self.dec_pos = PosEmbed(decoder_dim, num_slots, pos_mode)
+        self.decoder = nn.ModuleList([TransformerBlock(decoder_dim, num_heads, dropout) for _ in range(decoder_layers)])
+        self.dec_norm = nn.LayerNorm(decoder_dim)
+        self.head = nn.Linear(decoder_dim, in_ch)
 
-        torch.nn.init.normal_(self.mask_token, std=0.02)
+        for p in (self.missing_token, self.macro_pos, self.mask_token):
+            nn.init.normal_(p, std=0.02)
 
-    def random_masking(self, x, mask_ratio):
-        B, N, D = x.shape
-        if mask_ratio == 0.0:
-            return x, torch.zeros([B, N], device=x.device), torch.arange(N, device=x.device).unsqueeze(0).repeat(B, 1)
+    # ---------- Masking (observed children only) ----------
+    def make_mask(self, coords, state, ratio):
+        valid = state == 2
+        B, S = valid.shape
+        if ratio <= 0:
+            return torch.zeros_like(valid)
+        n_valid = valid.sum(1)
+        n_mask = torch.floor(n_valid.float() * ratio).long()
+        n_mask = torch.minimum(n_mask, (n_valid - 1).clamp(min=0))   # keep at least one visible child
+        n_mask = torch.where(n_valid >= 2, n_mask.clamp(min=1), torch.zeros_like(n_mask))
 
-        len_keep = int(N * (1 - mask_ratio))
-        noise = torch.rand(B, N, device=x.device)
-        ids_shuffle = torch.argsort(noise, dim=1)
-        ids_restore = torch.argsort(ids_shuffle, dim=1)
-        ids_keep = ids_shuffle[:, :len_keep]
+        if self.hparams.masking == "block":
+            # Pick a random observed child as the center and mask the closest children first
+            r = torch.rand(B, S, device=coords.device).masked_fill(~valid, -1.0)
+            center = coords[torch.arange(B), r.argmax(1)].unsqueeze(1)
+            dist = (coords - center).norm(dim=-1)
+            score = -(dist + torch.randn_like(dist) * self.hparams.block_noise_km)
+        else:
+            score = torch.rand(B, S, device=coords.device)
+        score = score.masked_fill(~valid, float("-inf"))
+        rank = score.argsort(dim=1, descending=True).argsort(dim=1)
+        return rank < n_mask.unsqueeze(1)
 
-        x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
-        mask = torch.ones([B, N], device=x.device)
-        mask[:, :len_keep] = 0
-        mask = torch.gather(mask, dim=1, index=ids_restore)
-        return x_masked, mask, ids_restore
+    # ---------- Encoder ----------
+    def encode(self, x, coords, state, mask_ratio=None):
+        if mask_ratio is None:
+            mask_ratio = self.hparams.mask_ratio
+        masked = self.make_mask(coords, state, mask_ratio)
+        visible = (state == 2) & ~masked
 
-    def encode(self, x, rel_coords, mask_ratio=None):
-        if mask_ratio is None: mask_ratio = self.mask_ratio
-        
-        pos_embed = self.coord_to_pos_embed(rel_coords) 
-        x = self.patch_embed(x) + pos_embed 
+        tok = self.patch_embed(x)
+        tok = torch.where((state == 1).unsqueeze(-1), self.missing_token.expand_as(tok), tok)
+        tok = tok + self.enc_pos(coords)
+        tok = tok * (~masked).unsqueeze(-1)            # zero out masked children (also excluded by the key mask)
 
-        x, mask, ids_restore = self.random_masking(x, mask_ratio)
-        
-        return self.encoder(x), mask, ids_restore
+        # Macro token: mean of visible children only (no information from masked children)
+        vis_f = visible.unsqueeze(-1).float()
+        macro_in = (x * vis_f).sum(1) / vis_f.sum(1).clamp(min=1.0)
+        macro = self.macro_embed(macro_in).unsqueeze(1) + self.macro_pos
 
-    def decode(self, x, ids_restore, rel_coords):
-        x = self.decoder_embed(x)
-        
-        mask_tokens = self.mask_token.repeat(x.shape[0], ids_restore.shape[1] - x.shape[1], 1)
-        x_ = torch.cat([x, mask_tokens], dim=1)
-        x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))
+        seq = torch.cat([macro, tok], 1)
+        key_valid = torch.cat([
+            torch.ones(x.shape[0], 1, dtype=torch.bool, device=x.device),
+            (state >= 1) & ~masked,    # missing tokens are visible; masked and non-existent positions are not
+        ], 1)
+        for blk in self.encoder:
+            seq = blk(seq, key_valid)
+        return self.enc_norm(seq), masked
 
-        dec_pos_embed = self.coord_to_dec_pos_embed(rel_coords)
-        
-        x_ = x_ + dec_pos_embed
-        x_ = self.decoder(x_)
-        return x_ 
+    # ---------- Decoder ----------
+    def decode(self, latent, masked, coords, state):
+        d = self.decoder_embed(latent)
+        child = d[:, 1:]
+        child = torch.where(masked.unsqueeze(-1), self.mask_token.expand_as(child), child)
+        child = child + self.dec_pos(coords)
+        seq = torch.cat([d[:, :1], child], 1)
+        key_valid = torch.cat([
+            torch.ones(d.shape[0], 1, dtype=torch.bool, device=d.device),
+            state >= 1,
+        ], 1)
+        for blk in self.decoder:
+            seq = blk(seq, key_valid)
+        return self.head(self.dec_norm(seq))[:, 1:]
 
-    def forward(self, batch):
-        inputs, rel_coords = batch
-        latent, mask, ids_restore = self.encode(inputs, rel_coords, mask_ratio=self.mask_ratio)
-        pred = self.decode(latent, ids_restore, rel_coords)
-        return pred, inputs, mask
+    def _step(self, batch):
+        x, coords, state, _ = batch
+        latent, masked = self.encode(x, coords, state)
+        pred = self.decode(latent, masked, coords, state)
+        per_tok = (pred.float() - x.float()).pow(2).mean(-1)
+        m = masked.float()
+        return (per_tok * m).sum() / m.sum().clamp(min=1.0)    # MSE on masked observed children
 
     def training_step(self, batch, batch_idx):
-        rec, target, mask = self(batch)
-        loss = (rec - target).pow(2).mean(dim=-1)
-        loss = (loss * mask).sum() / mask.sum()
-        self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+        loss = self._step(batch)
+        self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=batch[0].shape[0])
         return loss
 
-    def configure_optimizers(self):
-        return torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay, betas=(0.9, 0.95))
+    def validation_step(self, batch, batch_idx):
+        loss = self._step(batch)
+        self.log("val_loss", loss, on_epoch=True, prog_bar=True, batch_size=batch[0].shape[0])
 
-# ==========================================
-# 4. Main Routine: Pre-training & Extraction
-# ==========================================
+    def configure_optimizers(self):
+        hp = self.hparams
+        opt = torch.optim.AdamW(self.parameters(), lr=hp.lr, weight_decay=hp.weight_decay, betas=(0.9, 0.95))
+        sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=hp.max_epochs, eta_min=hp.lr * hp.cosine_alpha)
+        return {"optimizer": opt, "lr_scheduler": sch}
+
+
+# ==========================================================
+# Main
+# ==========================================================
 if __name__ == "__main__":
-    data_path = './data/houston_harris_FLATTENED_FILLED_DIM_REDUCED.parquet'
-    dataset = H3SpatialDataset(data_path, seq_len=64)
-    
-    num_cores = min(4, os.cpu_count() or 1)
-    
-    train_loader = DataLoader(dataset, batch_size=128, shuffle=True, num_workers=num_cores)
-    
-    print("\nStarting S2Vec Spatial Pre-training (Dynamic Coord, No-CLS)...")
-    
-    model = S2VecModelSpatialH3(in_ch=dataset.in_ch)
-    
-    early_stop_callback = EarlyStopping(
-        monitor="train_loss", 
-        min_delta=0.0001,     
-        patience=5,           
-        verbose=True,
-        mode="min"            
+    pl_lightning.seed_everything(SEED, workers=True)
+    os.makedirs(os.path.dirname(OUTPUT_PATH) or ".", exist_ok=True)
+    os.makedirs(CKPT_DIR, exist_ok=True)
+
+    ds = H3HierarchicalDataset(DATA_PATH, HEX_COL, PARENT_RES, CHILD_RES)
+
+    # Validation split by parent
+    rng = np.random.default_rng(SEED)
+    trainable = np.where(ds.n_valid >= MIN_VALID_TRAIN)[0]
+    rng.shuffle(trainable)
+    n_val = max(1, int(len(trainable) * VAL_FRAC))
+    val_ids, train_ids = trainable[:n_val], trainable[n_val:]
+    print(f"Training parents: {len(train_ids)}, validation parents: {len(val_ids)}")
+
+    bs = min(BATCH_SIZE, len(train_ids))
+    drop_last = len(train_ids) >= 2 * bs
+    train_loader = DataLoader(torch.utils.data.Subset(ds, train_ids), batch_size=bs, shuffle=True,
+                              drop_last=drop_last, collate_fn=ds.collate, num_workers=NUM_WORKERS)
+    val_loader = DataLoader(torch.utils.data.Subset(ds, val_ids), batch_size=bs, shuffle=False,
+                            collate_fn=ds.collate, num_workers=NUM_WORKERS)
+    assert len(train_loader) > 0, "No training batches; reduce BATCH_SIZE"
+    print(f"Batches per epoch: {len(train_loader)} (batch size {bs})")
+
+    model = S2VecModelSpatialH3(
+        in_ch=ds.in_ch, num_slots=ds.num_slots, embed_dim=EMBED_DIM, decoder_dim=DECODER_DIM,
+        encoder_layers=ENCODER_LAYERS, decoder_layers=DECODER_LAYERS, num_heads=NUM_HEADS,
+        dropout=DROPOUT, mask_ratio=MASK_RATIO, masking=MASKING, pos_mode=POS_MODE, lr=LR,
+        weight_decay=WEIGHT_DECAY, max_epochs=MAX_EPOCHS, cosine_alpha=COSINE_ALPHA,
+        block_noise_km=BLOCK_NOISE_KM,
     )
-    
-    checkpoint_callback = ModelCheckpoint(
-        monitor="train_loss",
-        dirpath="./checkpoints",
-        filename="s2vec-best",
-        save_top_k=1,
-        mode="min"
-    )
-    
+
+    ckpt_cb = ModelCheckpoint(dirpath=CKPT_DIR, filename="best", monitor="val_loss", mode="min",
+                              save_top_k=1, enable_version_counter=False)
+    es_cb = EarlyStopping(monitor="val_loss", mode="min", patience=PATIENCE, min_delta=1e-4)
     trainer = pl_lightning.Trainer(
-        max_epochs=300, 
-        accelerator="auto", 
-        gradient_clip_val=2.0,
-        enable_checkpointing=True,
-        logger=False,
-        callbacks=[early_stop_callback, checkpoint_callback]
+        max_epochs=MAX_EPOCHS, accelerator="auto",
+        precision="16-mixed" if torch.cuda.is_available() else "32-true",
+        gradient_clip_val=GRAD_CLIP, callbacks=[ckpt_cb, es_cb], logger=False,
+        enable_model_summary=False,
     )
-    trainer.fit(model, train_dataloaders=train_loader)
-    
-    print("\nTraining complete. Loading best weights and extracting embeddings...")
-    best_model_path = checkpoint_callback.best_model_path
-    if best_model_path:
-        print(f"Loaded best checkpoint: {best_model_path}")
-        model = S2VecModelSpatialH3.load_from_checkpoint(best_model_path)
-    else:
-        print("Warning: Checkpoint not found. Using current weights.")
-        
-    model.eval()
+    trainer.fit(model, train_loader, val_loader)
+
+    best = ckpt_cb.best_model_path
+    assert best and os.path.exists(best), "Best checkpoint not found"
+    print(f"Best checkpoint: {best} (val_loss = {float(ckpt_cb.best_model_score):.4f})")
+    model = S2VecModelSpatialH3.load_from_checkpoint(best)
+
+    # Extract embeddings: one unmasked forward pass per parent, encoder output of each observed child
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    
-    extract_loader = DataLoader(dataset, batch_size=128, shuffle=False, num_workers=num_cores)
-    all_embeddings = []
-    
+    model.to(device).eval()
+    all_emb = np.zeros((len(ds.hex_ids), EMBED_DIM), dtype=np.float32)
+    done = np.zeros(len(ds.hex_ids), dtype=bool)
+    ext_loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=False, collate_fn=ds.collate, num_workers=NUM_WORKERS)
     with torch.no_grad():
-        for batch_x, rel_coords in tqdm(extract_loader, desc="Extracting Embeddings"):
-            batch_x = batch_x.to(device)
-            rel_coords = rel_coords.to(device)
-            
-            latent, _, _ = model.encode(batch_x, rel_coords, mask_ratio=0.0)
-            
-            center_embedding = latent[:, 0, :] 
-            all_embeddings.append(center_embedding.cpu().numpy())
-            
-    all_embeddings = np.vstack(all_embeddings)
-    
-    print("\nWriting embeddings to Parquet file...")
-    df_embeddings = pl.DataFrame({"hex_id": dataset.hex_ids})
-    
-    embed_dim = all_embeddings.shape[1]
-    emb_cols = [pl.Series(f"emb_{i}", all_embeddings[:, i]) for i in range(embed_dim)]
-    df_embeddings = df_embeddings.with_columns(emb_cols)
-    
-    output_filename = "./embedding/final_dynamic_no_cls.parquet"
-    
-    os.makedirs(os.path.dirname(output_filename), exist_ok=True) 
-    df_embeddings.write_parquet(output_filename)
-    
-    print(f"File saved to: {output_filename}")
-    print(f"DataFrame shape: {df_embeddings.shape} (1 hex_id column and {embed_dim} embedding columns)")
+        for x, coords, state, rows in tqdm(ext_loader, desc="Extracting embeddings"):
+            latent, _ = model.encode(x.to(device), coords.to(device), state.to(device), mask_ratio=0.0)
+            lat = latent[:, 1:].float().cpu().numpy()
+            rows = rows.numpy()
+            sel = rows >= 0
+            all_emb[rows[sel]] = lat[sel]
+            done[rows[sel]] = True
+
+    print(f"Extracted {done.sum()} / {len(done)} cells")
+    out = pl.DataFrame({"hex_id": ds.hex_ids}).with_columns(
+        [pl.Series(f"emb_{i}", all_emb[:, i]) for i in range(EMBED_DIM)]
+    ).filter(pl.Series(done))
+    out.write_parquet(OUTPUT_PATH)
+
+    cfg = {k: v for k, v in globals().items() if k.isupper() and isinstance(v, (int, float, str, list, type(None)))}
+    cfg.update({"child_res": ds.child_res, "num_features": ds.in_ch, "feature_cols": ds.feature_cols,
+                "best_ckpt": best, "best_val_loss": float(ckpt_cb.best_model_score)})
+    with open(OUTPUT_PATH.replace(".parquet", "_config.json"), "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2)
+    print(f"Saved embeddings to {OUTPUT_PATH}")

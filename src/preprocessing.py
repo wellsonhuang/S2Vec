@@ -1,173 +1,141 @@
+"""
+Feature preprocessing for H3 resolution-8 cells.
+
+Steps:
+  1. Drop identifier, geometry, label (SoVI, NRI), string, and temporal columns.
+  2. Flatten list columns (numeric lists -> mean, other lists -> first element).
+  3. Add missing-value indicators and impute by type
+     (counts/rates -> 0, continuous variables -> global mean).
+  4. Winsorize every numeric column at its 99.5th percentile.
+  5. Apply log(1 + x) to columns with skewness > 1 (ground elevation excluded).
+  6. Cast all features to Float32 and write the result to Parquet.
+"""
 import os
-import numpy as np
-os.environ['POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR'] = 'load_as_storage'
 
 import polars as pl
 import polars.selectors as cs
 
-# ==========================================
-# Main Execution Block
-# ==========================================
+os.environ["POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR"] = "load_as_storage"
+
+# ==========================================================
+# Configuration
+# ==========================================================
+INPUT_PATH = "./data/houston_harris_LIST_dataset.parquet"
+OUTPUT_PATH = "./data/houston_pre.parquet"
+
+COLS_TO_DROP = [
+    "County", "State", "Zipcode",
+    "hex_id_l7", "hex_id_l6",
+    "name", "brand", "sovi",
+    "highest_hazard_dam_name",
+]
+
+# Columns whose names contain these keywords are treated as counts/rates (missing -> 0)
+ZERO_KEYWORDS = ["count", "_n", "_km", "toxic", "proxy", "tests", "active", "outage",
+                 "damage", "rate", "fraction", "ratio", "hr"]
+WINSOR_QUANTILE = 0.995
+SKEW_THRESHOLD = 1.0
+NO_LOG_PREFIXES = ["avg_grnd_elv"]   # can be negative; never log-transformed
+
+NUMERIC_TYPES = (
+    pl.Int8, pl.Int16, pl.Int32, pl.Int64,
+    pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64,
+    pl.Float32, pl.Float64,
+)
+
+
 if __name__ == "__main__":
-    file_path = './data/texas_LIST_dataset.parquet'
-    output_file = './data/texas_FLATTENED_FILLED_dataset_final.parquet'
-    
-    print("Loading raw dataset...")
-    
+    print(f"Reading {INPUT_PATH}")
     try:
-        df = pl.read_parquet(file_path)
+        df = pl.read_parquet(INPUT_PATH)
     except Exception as e:
-        print(f"Failed to read file: {e}")
-        exit()
-        
-    original_columns = set(df.columns)
+        raise SystemExit(f"Failed to read input file: {e}")
 
-    # ---------------------------------------------------------
-    # Step 1: Remove basic identifiers, geometry, and all NRI features
-    # ---------------------------------------------------------
-    cols_to_drop = [
-        "County", "State", "Zipcode", 
-        "hex_id_l7", "hex_id_l6", 
-        "name", "brand", "sovi",
-        "highest_hazard_dam_name" # String type outlier feature, drop directly
-    ]
-
-    print("Dropping basic labels, geometry, and NRI features...")
+    # ------------------------------------------------------
+    # Step 1: drop identifiers, geometry, labels and non-numeric columns
+    # ------------------------------------------------------
+    print("Dropping identifier, geometry, SoVI and NRI columns")
     df_cleaned = (
-        df.drop(cols_to_drop, strict=False)
+        df.drop(COLS_TO_DROP, strict=False)
           .drop(cs.contains("geometry"))
           .drop(cs.contains("nri"))
     )
+    string_and_time_cols = [
+        c for c, dt in df_cleaned.schema.items()
+        if c != "hex_id" and (dt == pl.String or dt == pl.Categorical or dt.is_temporal())
+    ]
+    df_cleaned = df_cleaned.drop(string_and_time_cols, strict=False)
 
-    # ---------------------------------------------------------
-    # Step 2: List Flattening -> Convert array features to scalar statistics
-    # ---------------------------------------------------------
-    print("Flattening list arrays into scalar values...")
-    numeric_types = (
-        pl.Int8, pl.Int16, pl.Int32, pl.Int64,
-        pl.UInt8, pl.UInt16, pl.UInt32, pl.UInt64,
-        pl.Float32, pl.Float64
-    )
-
+    # ------------------------------------------------------
+    # Step 2: flatten list columns into scalars
+    # ------------------------------------------------------
+    print("Flattening list columns")
     scalar_exprs = []
     for col, dtype in df_cleaned.schema.items():
-        if col == "hex_id": 
+        if col == "hex_id":
             continue
         if isinstance(dtype, pl.List):
-            if dtype.inner in numeric_types:
-                scalar_exprs.append(pl.col(col).list.mean())   # Mean for numeric arrays
+            if dtype.inner in NUMERIC_TYPES:
+                scalar_exprs.append(pl.col(col).list.mean().alias(col))
             else:
-                scalar_exprs.append(pl.col(col).list.first())  # First element for non-numeric arrays
+                scalar_exprs.append(pl.col(col).list.first().alias(col))
         else:
             scalar_exprs.append(pl.col(col))
-
     df_scalar = df_cleaned.select(["hex_id"] + scalar_exprs)
 
-    # ---------------------------------------------------------
-    # Step 3: Feature Stratification and Missing Value Imputation
-    # ---------------------------------------------------------
+    # ------------------------------------------------------
+    # Step 3: missing-value indicators and type-specific imputation
+    # ------------------------------------------------------
     all_numeric_cols = [c for c, dt in df_scalar.schema.items() if dt.is_numeric() and c != "hex_id"]
-    
-    # 1. Strict zero-fill list (exclude population, sqft to avoid creating false spatial signals)
-    zero_keywords = ["count", "_n", "_km", "toxic", "proxy", "tests", "active", "outage"]
     zero_cols = [
-        c for c in all_numeric_cols 
-        if any(kw in c.lower() for kw in zero_keywords)
-        and not c.lower().startswith("avg_")
+        c for c in all_numeric_cols
+        if any(kw in c.lower() for kw in ZERO_KEYWORDS) and not c.lower().startswith("avg_")
     ]
-    
-    # 2. Mean-fill list (remaining continuous variables; will become 0 after standardization)
     mean_cols = [c for c in all_numeric_cols if c not in zero_cols]
 
-    print("Executing stratified missing value imputation (Zero, Mean)...")
+    print("Adding missing-value indicators for mean-imputed columns")
+    missing_exprs = [pl.col(c).is_null().cast(pl.Float32).alias(f"{c}_is_missing") for c in mean_cols]
+    if missing_exprs:
+        df_scalar = df_scalar.with_columns(missing_exprs)
 
+    print("Imputing missing values (counts/rates -> 0, continuous -> mean)")
     if zero_cols:
-        df_scalar = df_scalar.with_columns(
-            [pl.col(c).fill_null(0).fill_nan(0) for c in zero_cols]
-        )
-        print(f"  [Phase 1/2] Filled {len(zero_cols)} 'physical quantity and facility' features with 0")
-
+        df_scalar = df_scalar.with_columns([pl.col(c).fill_null(0).fill_nan(0) for c in zero_cols])
     if mean_cols:
         df_scalar = df_scalar.with_columns(
             [pl.col(c).fill_null(pl.col(c).mean()).fill_nan(pl.col(c).mean()) for c in mean_cols]
         )
-        print(f"  [Phase 2/2] Filled remaining {len(mean_cols)} 'continuous/population/area' features with global mean")
 
-    # ---------------------------------------------------------
-    # Step 4: Log1p Transformation (for heavily right-skewed features)
-    # ---------------------------------------------------------
-    print("Applying Log1p transformation to highly skewed features...")
-    log1p_keywords = zero_keywords + ["population", "sqft", "income", "aaod", "d_final", "meters_out", "avg_val_struct", "damage"]
+    # ------------------------------------------------------
+    # Step 4: winsorization
+    # ------------------------------------------------------
+    print(f"Winsorizing at the {WINSOR_QUANTILE:.1%} quantile")
+    quantiles = df_scalar.select(
+        [pl.col(c).quantile(WINSOR_QUANTILE).alias(c) for c in all_numeric_cols]
+    ).to_dicts()[0]
+    clip_exprs = [pl.col(c).clip(upper_bound=quantiles[c]) for c in all_numeric_cols if quantiles[c] is not None]
+    if clip_exprs:
+        df_scalar = df_scalar.with_columns(clip_exprs)
+
+    # ------------------------------------------------------
+    # Step 5: log(1 + x) for right-skewed columns
+    # ------------------------------------------------------
+    print("Applying log(1 + x) to right-skewed columns")
+    skewness = df_scalar.select([pl.col(c).skew().alias(c) for c in all_numeric_cols])
     log1p_cols = [
-        c for c in all_numeric_cols 
-        if any(kw in c.lower() for kw in log1p_keywords) and not c.lower().startswith("avg_grnd_elv")
+        c for c in all_numeric_cols
+        if skewness[c][0] is not None and skewness[c][0] > SKEW_THRESHOLD
+        and not any(c.lower().startswith(p) for p in NO_LOG_PREFIXES)
     ]
-
     if log1p_cols:
         df_scalar = df_scalar.with_columns([pl.col(c).log1p() for c in log1p_cols])
-        print(f"  Completed ln(1+x) transformation for {len(log1p_cols)} long-tail features")
+    print(f"  log-transformed columns: {len(log1p_cols)}")
 
-    # ---------------------------------------------------------
-    # Step 5: Global Z-score Standardization
-    # ---------------------------------------------------------
-    print("Executing global feature Z-score standardization...")
-    feature_cols = [col for col in df_scalar.columns if col != "hex_id"]
-    eps = 1e-8
-    
-    exprs = []
-    for col in feature_cols:
-        col_expr = pl.col(col)
-        mean_expr = col_expr.mean()
-        std_expr = col_expr.std()
-        
-        # Prevent division by zero: if standard deviation is near 0, set feature value to 0
-        z_score_expr = pl.when(std_expr < eps).then(0.0).otherwise((col_expr - mean_expr) / std_expr)
-        exprs.append(z_score_expr.alias(col))
-        
-    df_final = df_scalar.with_columns(exprs)
-    print("  Z-score standardization complete.")
+    # ------------------------------------------------------
+    # Step 6: cast to Float32 and save
+    # ------------------------------------------------------
+    df_final = df_scalar.with_columns([pl.col(c).cast(pl.Float32) for c in df_scalar.columns if c != "hex_id"])
 
-    # ---------------------------------------------------------
-    # Step 6: Export Final Results and Print Audit Report
-    # ---------------------------------------------------------
-    os.makedirs(os.path.dirname(output_file), exist_ok=True)
-    df_final.write_parquet(output_file)
-
-    print("\nData flattening, imputation, log transformation, and standardization completed successfully.")
-    print(f"Processed file saved to: {output_file}")
-    print(f"Final data dimensions: {df_final.shape[0]:,} rows x {df_final.shape[1]} columns")
-
-    # Calculate residual null values
-    total_nulls = df_final.select(cs.numeric().is_null().sum()).sum_horizontal().item(0)
-    print(f"Residual null values in numeric features: {total_nulls}")
-
-    # ===== Print Feature Processing Audit Report =====
-    print("\n" + "="*80)
-    print(" Data Cleaning and Imputation Audit Report")
-    print("="*80)
-    
-    deleted_cols = sorted(list(original_columns - set(df_cleaned.columns)))
-    print(f"[Force Dropped] Basic labels/geometry/NRI fields ({len(deleted_cols)} total):")
-    print("   " + ", ".join(deleted_cols[:15]) + ("..." if len(deleted_cols) > 15 else ""))
-    print("-" * 80)
-
-    print(f"[Strategy 1: Zero-fill] Absolute presence features (e.g., facility counts, damages) ({len(zero_cols)} total):")
-    if zero_cols:
-        sorted_zero = sorted(zero_cols)
-        for i in range(0, len(sorted_zero), 3):
-            print("   " + ", ".join(sorted_zero[i:i+3]))
-    print("-" * 80)
-
-    print(f"[Strategy 2: Mean-fill] Continuous variables (e.g., population, area metrics) ({len(mean_cols)} total):")
-    if mean_cols:
-        sorted_mean = sorted(mean_cols)
-        for i in range(0, len(sorted_mean), 3):
-            print("   " + ", ".join(sorted_mean[i:i+3]))
-    print("-" * 80)
-    
-    print(f"[Strategy 3: Log1p Transformation] Handling long-tail distribution ({len(log1p_cols)} total):")
-    if log1p_cols:
-        sorted_log1p = sorted(log1p_cols)
-        for i in range(0, len(sorted_log1p), 3):
-            print("   " + ", ".join(sorted_log1p[i:i+3]))
-    print("="*80)
+    os.makedirs(os.path.dirname(OUTPUT_PATH) or ".", exist_ok=True)
+    df_final.write_parquet(OUTPUT_PATH)
+    print(f"Saved {OUTPUT_PATH} ({df_final.shape[0]:,} rows x {df_final.shape[1]} columns)")

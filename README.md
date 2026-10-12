@@ -7,3 +7,7 @@ Evaluation framework for spatial representation learning and downstream predicti
 ### August 20
 * Evaluated downstream performance using PDE and PREP features to model housing damage in relation to rainfall.
 * Conducted baseline prediction tests directly on raw dataset features.
+
+
+### Oct 12
+* Version for submission

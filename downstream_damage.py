@@ -16,6 +16,7 @@ Evaluation follows the S2Vec protocol:
 
 Results are reported for three subsets: cells inside the floodplain, cells outside it, and all cells.
 """
+import argparse
 import os
 import copy
 import warnings
@@ -40,12 +41,18 @@ os.environ["POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR"] = "load_as_storage"
 # ==========================================================
 # Configuration
 # ==========================================================
-MASTER_PATH = Path("predict/harris_final2.parquet")              # raw cell features
-EMB_PATH    = Path("Harris_Foundation_Model.parquet")            # cell embeddings
-RAIN_PATH   = Path("harris_county_h3_rain_features.parquet")     # MRMS rainfall features
-FLOOD_PATH  = Path("Harvey_MaxDepth_results.parquet")            # flood-depth features (floodplain cells only)
-PDE_PATH    = Path("harris_county_h3_pde_avg.parquet")           # target: mean PDE per cell
+MASTER_PATH = Path("data/houston_harris_dataset.parquet")              # raw cell features
+EMB_PATH    = Path("embedding/Harris_Foundation_Model.parquet")            # cell embeddings
+RAIN_PATH   = Path("data/harris_county_h3_rain_features.parquet")     # MRMS rainfall features
+FLOOD_PATH  = Path("data/Harvey_MaxDepth_results.parquet")            # flood-depth features (floodplain cells only)
+PDE_PATH    = Path("data/harris_county_h3_pde_avg.parquet")           # target: mean PDE per cell
 RESULT_CSV  = Path("results/damage_downstream.csv")
+
+_ap = argparse.ArgumentParser()
+_ap.add_argument("--emb", type=Path, default=EMB_PATH)
+_ap.add_argument("--out", type=Path, default=RESULT_CSV)
+_args = _ap.parse_known_args()[0]
+EMB_PATH, RESULT_CSV = _args.emb, _args.out
 
 NUM_RUNS     = 20
 MIN_SAMPLES  = 50
@@ -237,7 +244,8 @@ if __name__ == "__main__":
     print(f"Aligned cells: {df_merged.height:,}")
 
     # Feature sets
-    raw_cols = [c for c in df_master_clean.columns if c != "hex_id"]
+    raw_cols = [c for c, t in df_master_clean.schema.items()
+                if c != "hex_id" and t.is_numeric() and not any(k in c.lower() for k in ["sovi", "nri"])]
     emb_cols = [c for c in df_emb.columns if c != "hex_id"]
     rain_cols = [c for c in df_rain.columns if c != "hex_id"]
     features_raw = raw_cols + rain_cols + flood_cols

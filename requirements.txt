@@ -1,0 +1,19 @@
+# Python >= 3.10
+numpy>=1.26
+pandas>=2.1
+polars>=1.25
+pyarrow>=14
+h3>=4.0,<5          # h3 v4 API (cell_to_latlng, grid_disk, ...)
+torch>=2.1
+pytorch-lightning>=2.1
+scikit-learn>=1.3
+scipy>=1.11
+tqdm>=4.66
+
+# Hazard features, labels and figures (scripts/hazards, scripts/figures)
+geopandas>=0.14
+shapely>=2.0
+rasterio>=1.3       # MRMS GRIB2
+pygrib>=2.1         # HRRR GRIB2
+matplotlib>=3.8
+seaborn>=0.13

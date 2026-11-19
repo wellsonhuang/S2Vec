@@ -1,0 +1,17 @@
+# Data and generated outputs (see data/README.md)
+data/*
+!data/README.md
+embedding/
+checkpoints/
+results/
+figures/
+lightning_logs/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.ipynb_checkpoints/
+
+# OS
+.DS_Store

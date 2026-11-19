@@ -10,6 +10,7 @@ Steps:
   5. Apply log(1 + x) to columns with skewness > 1 (ground elevation excluded).
   6. Cast all features to Float32 and write the result to Parquet.
 """
+import argparse
 import os
 
 import polars as pl
@@ -20,8 +21,12 @@ os.environ["POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR"] = "load_as_storage"
 # ==========================================================
 # Configuration
 # ==========================================================
-INPUT_PATH = "./data/houston_harris_LIST_dataset.parquet"
-OUTPUT_PATH = "./data/houston_pre.parquet"
+REGION = "houston_harris"            # "houston_harris" | "texas"; or --region
+_ap = argparse.ArgumentParser()
+_ap.add_argument("--region", choices=["houston_harris", "texas"], default=REGION)
+REGION = _ap.parse_known_args()[0].region
+INPUT_PATH = f"./data/{REGION}_dataset.parquet"     # output of scripts/data/build_dataset.py
+OUTPUT_PATH = f"./data/{REGION}_pre.parquet"
 
 COLS_TO_DROP = [
     "County", "State", "Zipcode",

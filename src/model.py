@@ -13,6 +13,7 @@ which form one fixed-length token sequence.
   - The validation set is split by parent; the checkpoint with the lowest validation loss is kept.
   - Embeddings are the final encoder outputs of each child, computed without masking.
 """
+import argparse
 import os
 import math
 import json
@@ -36,9 +37,14 @@ torch.set_float32_matmul_precision("medium")
 # ==========================================================
 # Configuration
 # ==========================================================
-DATA_PATH   = "./data/texas_pre.parquet"
-OUTPUT_PATH = "./embedding/texas_final.parquet"
-CKPT_DIR    = "./checkpoints/texas_final"
+REGION      = "houston_harris"       # "houston_harris" | "texas"; or --region
+_ap = argparse.ArgumentParser()
+_ap.add_argument("--region", choices=["houston_harris", "texas"], default=REGION)
+REGION = _ap.parse_known_args()[0].region
+DATA_PATH   = f"./data/{REGION}_pre.parquet"
+OUTPUT_PATH = {"houston_harris": "./embedding/Harris_Foundation_Model.parquet",
+               "texas": "./embedding/Texas_Model.parquet"}[REGION]
+CKPT_DIR    = f"./checkpoints/{REGION}_h3_s2vec"
 HEX_COL     = "hex_id"
 LABEL_KEYWORDS = ["sovi", "nri"]     # columns containing these keywords are never used as features
 

@@ -55,11 +55,11 @@ os.environ["POLARS_UNKNOWN_EXTENSION_TYPE_BEHAVIOR"] = "load_as_storage"
 # ==========================================================
 # Configuration
 # ==========================================================
-MASTER_PATH = Path("data/houston_harris_final_dataset.parquet")       # raw cell features
+MASTER_PATH = Path("data/houston_harris_dataset.parquet")       # raw cell features
 WIND_PATH   = Path("data/harris_h3l8_wind_features.parquet")          # HRRR wind features
 OUTAGE_PATH = Path("data/harris_h3l8_beryl_outage.parquet")           # outage targets per cell
 FLOOD_PATH  = Path("data/Harvey_MaxDepth_results.parquet")            # flood-depth features (floodplain cells only)
-ZIP_LOOKUP_PATH    = Path("data/hex_county_state_zip_crosswalk.parquet")  # H3 cell -> ZIP code
+ZIP_LOOKUP_PATH    = Path("data/raw/hex_county_state_zip_crosswalk.parquet")  # H3 cell -> ZIP code
 ZIP_LOOKUP_ZIP_COL = "Zipcode"
 ZIP_LOOKUP_COUNTY  = "Harris"          # keep only rows of this county (exact match); None = no filter
 
@@ -67,8 +67,8 @@ ZIP_LOOKUP_COUNTY  = "Harris"          # keep only rows of this county (exact ma
 # Wind and flood features are appended to every set.
 FEATURE_SETS = {
     "Dataset only": "MASTER",
-    "H3-S2Vec":     "embedding/harris_h3_s2vec.parquet",
-    "H3-S2Vec-C":   "embedding/harris_h3_s2vec_c.parquet",
+    "H3-S2Vec":     "embedding/Harris_Foundation_Model.parquet",
+    "H3-S2Vec-C":   "embedding/Harris_Foundation_Model_C.parquet",
 }
 
 TARGETS        = ["T1_total_hours", "T2_peak_avg_pct", "T3_days_to_restore"]

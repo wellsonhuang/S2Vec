@@ -9,6 +9,7 @@ Downstream evaluation of cell embeddings (following the S2Vec protocol).
   - Reports test R^2 and MAE (on scaled targets) as mean +/- standard deviation.
   - Rows are sorted by hex_id, so different embeddings are evaluated on identical splits.
 """
+import argparse
 import os
 import copy
 import warnings
@@ -29,8 +30,8 @@ warnings.filterwarnings("ignore")
 # ==========================================================
 # Configuration
 # ==========================================================
-EMB_PATH     = "./embedding/Harris_Foundation_Model.parquet"
-DATASET_PATH = "./data/houston_harris_LIST_dataset.parquet"
+EMB_PATH     = "./embedding/Harris_Foundation_Model.parquet"   # or Texas_Model / Harris_Foundation_Model_C
+DATASET_PATH = "./data/houston_harris_dataset.parquet"
 TARGETS      = ["sovi", "nri_cri_value", "nri_cri_score"]
 NUM_RUNS     = 20
 ENABLE_HPO   = True
@@ -45,6 +46,14 @@ PARAM_GRID = [
     {"hidden_dim": 128, "lr": 0.0005, "dropout_rate": 0.2},
 ]
 DEFAULT_CONFIG = {"hidden_dim": 128, "lr": 0.001, "dropout_rate": 0.1}
+RESULT_CSV   = None                  # e.g. "results/task1.csv"; None = print only
+
+_ap = argparse.ArgumentParser()
+_ap.add_argument("--emb", default=EMB_PATH)
+_ap.add_argument("--dataset", default=DATASET_PATH)
+_ap.add_argument("--out", default=RESULT_CSV)
+_args = _ap.parse_known_args()[0]
+EMB_PATH, DATASET_PATH, RESULT_CSV = _args.emb, _args.dataset, _args.out
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -211,4 +220,8 @@ if __name__ == "__main__":
 
     print("\nDownstream evaluation results:")
     if results:
-        print(pd.DataFrame(results).to_string(index=False))
+        df_res = pd.DataFrame(results)
+        print(df_res.to_string(index=False))
+        if RESULT_CSV:
+            os.makedirs(os.path.dirname(RESULT_CSV) or ".", exist_ok=True)
+            df_res.to_csv(RESULT_CSV, index=False)
